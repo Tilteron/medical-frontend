@@ -1,146 +1,102 @@
-import { useState } from "react";
-import { uploadToIpfs } from "../services/ipfs";
-import { Keyring } from "@polkadot/keyring";
-import { checkAccess, getRecord } from "../services/substrate";
+import { useState, useEffect } from "react";
+import { checkAccess, getRecord } from "../services/substrate.js";
+import { decryptAESKey, importKeyPair } from "../crypto/rsa";
+import { decryptFile } from "../crypto/aes.js";
+
+function hexToUtf8String(hex) {
+    if (!hex || hex === '0x') return '';
+    const clean = hex.startsWith('0x') ? hex.slice(2) : hex;
+    return new TextDecoder().decode(new Uint8Array(clean.match(/.{1,2}/g).map(b => parseInt(b, 16))));
+}
 
 export default function DoctorView() {
     const [recordId, setRecordId] = useState("");
     const [result, setResult] = useState(null);
     const [loading, setLoading] = useState(false);
+    const [imageUrl, setImageUrl] = useState(null);
+    const [doctorKeys, setDoctorKeys] = useState({});
 
-    //врачи
-    const doctors=
-        {
-            Bob: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
-            Charlie: "5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y",
-        }
-    const [selectedDoctor, setSelectedDoctor] =
-        useState("Bob");
+    const doctors = {
+        Bob: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty",
+        Charlie: "5FLSigC9HGRKVhB9FiEo4Y3koPsNmBmLJbpXg2mp1hXcS59Y",
+    };
+    const [selectedDoctor, setSelectedDoctor] = useState("Bob");
+
+    // Загрузка тех же ключей из localStorage
+    useEffect(() => {
+        (async () => {
+            const loadKeys = async (keyName) => {
+                const stored = localStorage.getItem(keyName);
+                if (!stored) throw new Error(`Keys not found. Upload a file first.`);
+                const parsed = JSON.parse(stored);
+                return await importKeyPair(parsed.publicKey, parsed.privateKey);
+            };
+            try {
+                setDoctorKeys({
+                    Bob: await loadKeys("doctor_bob_keys"),
+                    Charlie: await loadKeys("doctor_charlie_keys"),
+                });
+            } catch (e) { console.error(e.message); }
+        })();
+    }, []);
 
     const handleOpen = async () => {
-        console.log("CLICK OPEN");
-
-        if (!recordId) {
-            console.log("EMPTY ID");
-            return;
-        }
-
+        if (!recordId) return;
         setLoading(true);
         setResult(null);
+        setImageUrl(null);
 
         try {
-            console.log("recordId:", recordId);
-            console.log("doctor:", selectedDoctor);
-
             const doctorAddress = doctors[selectedDoctor];
+            const doctorKeyPair = doctorKeys[selectedDoctor];
+            if (!doctorKeyPair) throw new Error("Doctor keys not loaded");
 
-            console.log("doctorAddress:", doctorAddress);
+            const record = await getRecord(Number(recordId), doctorAddress);
+            if (!record) return setResult({ status: "notfound" });
 
-            const record = await getRecord(Number(recordId));
-
-            console.log("record:", record);
-
-            if (!record) {
-                setResult({ status: "notfound" });
-                setLoading(false);
-                return;
+            if (!(await checkAccess(Number(recordId), doctorAddress))) {
+                return setResult({ status: "denied" });
             }
 
-            const hasAccess = await checkAccess(
-                Number(recordId),
-                doctorAddress
-            );
+            // 1. Скачиваем файл (теперь он содержит IV + ciphertext)
+            const cidStr = hexToUtf8String(record.cid);
+            const res = await fetch(`http://127.0.0.1:8080/ipfs/${cidStr}`, { signal: AbortSignal.timeout(15000) });
+            if (!res.ok) throw new Error(`IPFS ${res.status}`);
+            const combinedBuffer = new Uint8Array(await res.arrayBuffer());
 
-            console.log("hasAccess:", hasAccess);
+            // 2. Расшифровываем AES-ключ
+            const encryptedKey = record.encryptedKey;
+            if (!encryptedKey || encryptedKey.length !== 256) throw new Error(`Invalid key length: ${encryptedKey?.length || 0}`);
 
-            if (!hasAccess) {
-                setResult({ status: "denied" });
-                setLoading(false);
-                return;
-            }
+            const aesKeyBytes = await decryptAESKey(encryptedKey, doctorKeyPair.privateKey);
 
-            setResult({
-                status: "ok",
-                cid: record.cid,
-                owner: record.owner,
-            });
+            // 3. Расшифровываем файл (IV автоматически извлекается внутри decryptFile)
+            const decrypted = await decryptFile(combinedBuffer, aesKeyBytes);
 
+            setImageUrl(URL.createObjectURL(new Blob([decrypted], { type: "image/jpeg" })));
+            setResult({ status: "ok", cid: cidStr, owner: record.owner });
         } catch (e) {
-            console.error("ERROR:", e);
+            console.error("❌ ERROR:", e);
+            setResult({ status: "error", message: e.message });
+        } finally {
+            setLoading(false);
         }
-
-        setLoading(false);
     };
 
     return (
         <div style={{ marginTop: 40 }}>
             <h2>Doctor View</h2>
-
-            <div style={{ marginBottom: 20 }}>
-                <label>Doctor: </label>
-
-                <select
-                    value={selectedDoctor}
-                    onChange={(e) =>
-                        setSelectedDoctor(
-                            e.target.value
-                        )
-                    }
-                >
-                    <option value="Bob">
-                        Bob
-                    </option>
-
-                    <option value="Charlie">
-                        Charlie
-                    </option>
-                </select>
-            </div>
-
-            <input
-                placeholder="Record ID"
-                value={recordId}
-                onChange={(e) =>
-                    setRecordId(e.target.value)
-                }
-            />
-
-            <button
-                onClick={handleOpen}
-                disabled={loading}
-                style={{ marginLeft: 10 }}
-            >
+            <select value={selectedDoctor} onChange={e => setSelectedDoctor(e.target.value)}>
+                <option value="Bob">Bob</option><option value="Charlie">Charlie</option>
+            </select>
+            <input placeholder="Record ID" value={recordId} onChange={e => setRecordId(e.target.value)} />
+            <button onClick={handleOpen} disabled={loading} style={{ marginLeft: 10 }}>
                 {loading ? "Checking..." : "Open record"}
             </button>
-
-            {result?.status === "notfound" && (
-                <p style={{ color: "gray" }}>
-                    Record not found
-                </p>
-            )}
-
-            {result?.status === "denied" && (
-                <div style={{ color: "red", marginTop: 20 }}>
-                    ❌ Access Denied
-                </div>
-            )}
-
-            {result?.status === "ok" && (
-                <div>
-                    <p>✅ Access Granted</p>
-
-                    <p>Owner: {result.owner}</p>
-
-                    <p>CID: {result.cid}</p>
-
-                    <div style={{ marginTop: 20 }}>
-                        <img
-                            width={300}
-                            src="https://upload.wikimedia.org/wikipedia/commons/3/3f/Chest_Xray_PA_3-8-2010.png"
-                        />
-                    </div>
-                </div>
-            )}
+            {result?.status === "ok" && imageUrl && <img src={imageUrl} width={300} style={{ marginTop: 20 }} />}
+            {result?.status === "error" && <p style={{ color: "red" }}>❌ {result.message}</p>}
+            {result?.status === "denied" && <p style={{ color: "red" }}>❌ Access Denied</p>}
+            {result?.status === "notfound" && <p style={{ color: "gray" }}>Record not found</p>}
         </div>
     );
 }
